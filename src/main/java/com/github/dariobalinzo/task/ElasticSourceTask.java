@@ -42,6 +42,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -145,7 +148,8 @@ public class ElasticSourceTask extends SourceTask {
                         String lastValue = fetchLastOffset(index);
                         logger.info("found last value {}", lastValue);
                         if (lastValue != null) {
-                            executeScroll(index, lastValue, results);
+                            String slideLastValue = slideLastValue(lastValue, 1000);
+                            executeScroll(index, slideLastValue, results);
                         }
                         logger.info("index {} total messages: {} ", index, sent.get(index));
                     }
@@ -156,6 +160,12 @@ public class ElasticSourceTask extends SourceTask {
             Thread.sleep(pollingMs);
         }
         return results;
+    }
+
+    public String slideLastValue(String lastValue, long millis) {
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX");
+        ZonedDateTime dateTime = ZonedDateTime.parse(lastValue, formatter).minus(millis, ChronoUnit.MILLIS);
+        return dateTime.format(formatter);
     }
 
     private String fetchLastOffset(String index) {
@@ -200,7 +210,7 @@ public class ElasticSourceTask extends SourceTask {
             int totalShards = searchResponse.getTotalShards();
             int successfulShards = searchResponse.getSuccessfulShards();
 
-            logger.info("total shard {}, successuful: {}", totalShards, successfulShards);
+            logger.debug("total shard {}, successuful: {}", totalShards, successfulShards);
 
             int failedShards = searchResponse.getFailedShards();
             for (ShardSearchFailure failure : searchResponse.getShardFailures()) {
@@ -228,6 +238,7 @@ public class ElasticSourceTask extends SourceTask {
     }
 
     private void executeScroll(String index, String lastValue, List<SourceRecord> results) {
+        logger.info("executing scroll on index {} from {}", index, lastValue);
         SearchRequest searchRequest = new SearchRequest(index);
         searchRequest.scroll(TimeValue.timeValueMinutes(1L));
         SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
@@ -290,8 +301,8 @@ public class ElasticSourceTask extends SourceTask {
         int totalShards = searchResponse.getTotalShards();
         int successfulShards = searchResponse.getSuccessfulShards();
 
-        logger.info("total shard {}, successful: {}", totalShards, successfulShards);
-        logger.info("retrieved {}, scroll id : {}", hits, scrollId);
+        logger.debug("total shard {}, successful: {}", totalShards, successfulShards);
+        logger.debug("retrieved {}, scroll id : {}", hits, scrollId);
 
         int failedShards = searchResponse.getFailedShards();
         for (ShardSearchFailure failure : searchResponse.getShardFailures()) {
@@ -303,12 +314,30 @@ public class ElasticSourceTask extends SourceTask {
         }
 
         SearchHit[] searchHits = hits.getHits();
+        logger.info("parsing {} hits from index {}", searchHits.length, index);
+
+        // Fetch the fixed values of label.key and label.value from configuration
+        String labelKey = null;
+        String labelValue = null;
+        if (config == null) {
+            logger.warn("null instance of ElasticSourceConnectorConfig, skipping labels");
+        } else {
+            labelKey = config.getString(ElasticSourceConnectorConfig.LABEL_KEY);
+            labelValue = config.getString(ElasticSourceConnectorConfig.LABEL_VALUE);
+
+            if (labelKey == null) {
+                logger.warn("label.key is null, skipping labels");
+            }
+        }
+
         for (SearchHit hit : searchHits) {
             // do something with the SearchHit
             Map<String, Object> sourceAsMap = hit.getSourceAsMap();
 
-            // Add the label in the configuration
-            Utils.addLabel(sourceAsMap, config);
+            // Add the label to hits
+            if (labelKey != null) {
+                Utils.addLabel(sourceAsMap, labelKey, labelValue);
+            }
 
             Map<String, String> sourcePartition = Collections.singletonMap(INDEX, index);
             Map<String, String> sourceOffset = Collections.singletonMap(POSITION, sourceAsMap.get(incrementingField).toString());
@@ -347,7 +376,7 @@ public class ElasticSourceTask extends SourceTask {
             logger.error("error in clear scroll", e);
         }
         boolean succeeded = clearScrollResponse != null && clearScrollResponse.isSucceeded();
-        logger.info("scroll {} cleared: {}", scrollId, succeeded);
+        logger.debug("scroll {} cleared: {}", scrollId, succeeded);
     }
 
     //will be called by connect with a different thread than poll thread
