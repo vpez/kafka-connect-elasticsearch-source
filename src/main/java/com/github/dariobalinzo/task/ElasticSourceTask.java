@@ -42,6 +42,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -158,6 +161,14 @@ public class ElasticSourceTask extends SourceTask {
         return results;
     }
 
+    private String getRangeTo(String lastValue, long seconds) {
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX");
+        ZonedDateTime dateTime = ZonedDateTime.parse(lastValue, formatter).plus(seconds, ChronoUnit.SECONDS);
+        String maxValue = dateTime.format(formatter);
+        logger.info("------ Fetching from range {} to {} ------", lastValue, maxValue);
+        return maxValue;
+    }
+
     private String fetchLastOffset(String index) {
         //first we check in cache memory the last value
         if (last.get(index) != null) {
@@ -232,8 +243,11 @@ public class ElasticSourceTask extends SourceTask {
         searchRequest.scroll(TimeValue.timeValueMinutes(1L));
         SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
 
+        String maxValue = getRangeTo(lastValue, 60);
+
         QueryBuilder rangeQuery = rangeQuery(incrementingField)
-                .from(lastValue, last.get(index) == null);
+                .from(lastValue, last.get(index) == null)
+                .to(maxValue);
 
         BoolQueryBuilder queryBuilder = QueryBuilders
                 .boolQuery()
@@ -263,6 +277,11 @@ public class ElasticSourceTask extends SourceTask {
             }
             scrollId = searchResponse.getScrollId();
             SearchHit[] searchHits = parseSearchResult(index, lastValue, results, searchResponse, scrollId);
+
+            if (searchHits != null && searchHits.length == 0) {
+                last.put(index, maxValue);
+                logger.info("------ Setting last value to {} because no data was found", maxValue);
+            }
 
             while (!stopping.get() && searchHits != null && searchHits.length > 0 && results.size() < size) {
                 SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId);
