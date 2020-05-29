@@ -68,6 +68,7 @@ public class ElasticSourceTask extends SourceTask {
     private int size;
     private int pollingMs;
     private Map<String, String> last = new HashMap<>();
+    private Map<String, String> max = new HashMap<>();
     private Map<String, Integer> sent = new HashMap<>();
     private SourceQueryBuilder sourceQueryBuilder;
 
@@ -146,7 +147,7 @@ public class ElasticSourceTask extends SourceTask {
                     if (!stopping.get()) {
                         logger.info("fetching from {}", index);
                         String lastValue = fetchLastOffset(index);
-                        logger.info("found last value {}", lastValue);
+                        logger.debug("found last value {}", lastValue);
                         if (lastValue != null) {
                             executeScroll(index, lastValue, results);
                         }
@@ -161,12 +162,10 @@ public class ElasticSourceTask extends SourceTask {
         return results;
     }
 
-    private String getRangeTo(String lastValue, long seconds) {
+    private String getWindowEnd(String timeAndDate, long seconds) {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX");
-        ZonedDateTime dateTime = ZonedDateTime.parse(lastValue, formatter).plus(seconds, ChronoUnit.SECONDS);
-        String maxValue = dateTime.format(formatter);
-        logger.info("------ Fetching from range {} to {} ------", lastValue, maxValue);
-        return maxValue;
+        ZonedDateTime dateTime = ZonedDateTime.parse(timeAndDate, formatter).plus(seconds, ChronoUnit.SECONDS);
+        return dateTime.format(formatter);
     }
 
     private String fetchLastOffset(String index) {
@@ -195,6 +194,7 @@ public class ElasticSourceTask extends SourceTask {
         searchRequest.source(searchSourceBuilder);
         SearchResponse searchResponse = null;
         try {
+            // TODO refactor into method tryConnect()
             for (int i = 0; i < maxConnectionAttempts; ++i) {
                 try {
                     searchResponse = es.getClient().search(searchRequest);
@@ -211,7 +211,7 @@ public class ElasticSourceTask extends SourceTask {
             int totalShards = searchResponse.getTotalShards();
             int successfulShards = searchResponse.getSuccessfulShards();
 
-            logger.info("total shard {}, successuful: {}", totalShards, successfulShards);
+            logger.debug("total shard {}, successuful: {}", totalShards, successfulShards);
 
             int failedShards = searchResponse.getFailedShards();
             for (ShardSearchFailure failure : searchResponse.getShardFailures()) {
@@ -227,7 +227,6 @@ public class ElasticSourceTask extends SourceTask {
             for (SearchHit hit : searchHits) {
                 // do something with the SearchHit
                 return hit.getSourceAsMap().get(incrementingField).toString();
-
             }
 
         } catch (Exception e) {
@@ -235,7 +234,6 @@ public class ElasticSourceTask extends SourceTask {
             return null;
         }
         return null;
-
     }
 
     private void executeScroll(String index, String lastValue, List<SourceRecord> results) {
@@ -243,11 +241,14 @@ public class ElasticSourceTask extends SourceTask {
         searchRequest.scroll(TimeValue.timeValueMinutes(1L));
         SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
 
-        String maxValue = getRangeTo(lastValue, 60);
+        if (max.get(index) == null) {
+            max.put(index, getWindowEnd(lastValue, 60));
+            logger.info("Search range: {} - {}", last.get(index), max.get(index));
+        }
 
         QueryBuilder rangeQuery = rangeQuery(incrementingField)
                 .from(lastValue, last.get(index) == null)
-                .to(maxValue);
+                .to(max.get(index));
 
         BoolQueryBuilder queryBuilder = QueryBuilders
                 .boolQuery()
@@ -278,9 +279,12 @@ public class ElasticSourceTask extends SourceTask {
             scrollId = searchResponse.getScrollId();
             SearchHit[] searchHits = parseSearchResult(index, lastValue, results, searchResponse, scrollId);
 
+            // Increasing the window range if no data found, or reset
             if (searchHits != null && searchHits.length == 0) {
-                last.put(index, maxValue);
-                logger.info("------ Setting last value to {} because no data was found", maxValue);
+                max.put(index, getWindowEnd(max.get(index), 30));
+                logger.info("Search range: {} - {}", last.get(index), max.get(index));
+            } else {
+                max.put(index, null);
             }
 
             while (!stopping.get() && searchHits != null && searchHits.length > 0 && results.size() < size) {
@@ -295,8 +299,6 @@ public class ElasticSourceTask extends SourceTask {
         } finally {
             closeScrollQuietly(scrollId);
         }
-
-
     }
 
     private SearchHit[] parseSearchResult(String index, String lastValue, List<SourceRecord> results, SearchResponse searchResponse, Object scrollId) {
@@ -309,8 +311,8 @@ public class ElasticSourceTask extends SourceTask {
         int totalShards = searchResponse.getTotalShards();
         int successfulShards = searchResponse.getSuccessfulShards();
 
-        logger.info("total shard {}, successful: {}", totalShards, successfulShards);
-        logger.info("retrieved {}, scroll id : {}", hits, scrollId);
+        logger.debug("total shard {}, successful: {}", totalShards, successfulShards);
+        logger.debug("retrieved {}, scroll id : {}", hits, scrollId);
 
         int failedShards = searchResponse.getFailedShards();
         for (ShardSearchFailure failure : searchResponse.getShardFailures()) {
