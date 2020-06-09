@@ -70,6 +70,7 @@ public class ElasticSourceTask extends SourceTask {
     private int pollingMs;
     private Map<String, String> last = new HashMap<>();
     private Map<String, Integer> sent = new HashMap<>();
+    private Map<String, Set<SearchHit>> sentHits = new HashMap<>();
     private SourceQueryBuilder sourceQueryBuilder;
 
     public ElasticSourceTask() {
@@ -237,7 +238,7 @@ public class ElasticSourceTask extends SourceTask {
         SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
 
         QueryBuilder rangeQuery = rangeQuery(incrementingField)
-                .from(lastValue, true);
+                .from(lastValue, last.get(index) == null);
 
         BoolQueryBuilder queryBuilder = QueryBuilders
                 .boolQuery()
@@ -321,7 +322,15 @@ public class ElasticSourceTask extends SourceTask {
             }
         }
 
+        Set<SearchHit> sentBatch = new HashSet<>();
         for (SearchHit hit : searchHits) {
+
+            // Check duplicate
+            if (checkIfDuplicate(hit, index)) {
+                logger.info("duplicate hit {}. skip.", hit.getId());
+                continue;
+            }
+
             // do something with the SearchHit
             Map<String, Object> sourceAsMap = hit.getSourceAsMap();
 
@@ -351,31 +360,60 @@ public class ElasticSourceTask extends SourceTask {
 
             results.add(sourceRecord);
 
+            sentBatch.add(hit);
             sent.merge(index, 1, Integer::sum);
+            logger.info("sent hit with id {}", hit.getId());
         }
 
+        // Set current batch IDs
+        sentHits.put(index, sentBatch);
+        logger.info("sent total {} hits in this batch", sentBatch.size());
+
         // Mark the last value
-        String lastValue = markLastValue(index, searchHits);
-        logger.info("Mark last value for of {} = {}", index, lastValue);
+        String lastValue = markLastValue(index);
+        logger.info("mark last value for of {} ----> {}", index, lastValue);
         last.put(index, lastValue);
         return searchHits;
     }
 
-    private String markLastValue(String index, SearchHit[] searchHits) {
-        final int GUARD = 5;
+    private boolean checkIfDuplicate(SearchHit hit, String index) {
+        if (sentHits.get(index) == null || sentHits.get(index).isEmpty()) {
+            return false;
+        }
+
+        // If contains ID
+        return sentHits.get(index).stream()
+                .map(SearchHit::getId)
+                .anyMatch(id -> id.equals(hit.getId()));
+    }
+
+    private String markLastValue(String index) {
+
+        Set<SearchHit> hits = sentHits.get(index);
+
+        if (hits.isEmpty()) {
+            logger.info("no new hits, using previous last value {}", last.get(index));
+            return last.get(index);
+        }
 
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX");
 
-        List<ZonedDateTime> collect = Stream.of(searchHits)
+        List<ZonedDateTime> timestamps = hits.stream()
                 .map(hit -> hit.getSourceAsMap().get(incrementingField).toString())
                 .distinct()
                 .map(s -> ZonedDateTime.parse(s, formatter))
                 .sorted()
                 .collect(Collectors.toList());
 
-        return collect.size() < GUARD ?
-                last.get(index) :
-                formatter.format(collect.get(collect.size() - GUARD));
+        final int GUARD = 2;
+        if (timestamps.size() < GUARD) {
+            logger.info("set previous last value {}", last.get(index));
+            return last.get(index);
+        }
+
+        String value = formatter.format(timestamps.get(timestamps.size() - GUARD));
+        logger.info("set last value to {}", value);
+        return value;
     }
 
     private void closeScrollQuietly(String scrollId) {
