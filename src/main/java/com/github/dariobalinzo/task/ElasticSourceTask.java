@@ -47,7 +47,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static org.elasticsearch.index.query.QueryBuilders.rangeQuery;
 
@@ -322,7 +321,7 @@ public class ElasticSourceTask extends SourceTask {
             }
         }
 
-        Set<SearchHit> sentBatch = new HashSet<>();
+        Set<SearchHit> batch = new HashSet<>();
         for (SearchHit hit : searchHits) {
 
             // Check duplicate
@@ -360,14 +359,17 @@ public class ElasticSourceTask extends SourceTask {
 
             results.add(sourceRecord);
 
-            sentBatch.add(hit);
+            batch.add(hit);
             sent.merge(index, 1, Integer::sum);
             logger.info("sent hit with id {}", hit.getId());
         }
 
         // Set current batch IDs
-        sentHits.put(index, sentBatch);
-        logger.info("sent total {} hits in this batch", sentBatch.size());
+        if (!batch.isEmpty()) {
+            sentHits.put(index, batch);
+        }
+
+        logger.info("sent total {} hits in this batch", batch.size());
 
         // Mark the last value
         String lastValue = markLastValue(index);
@@ -405,7 +407,7 @@ public class ElasticSourceTask extends SourceTask {
                 .sorted()
                 .collect(Collectors.toList());
 
-        final int GUARD = 2;
+        final int GUARD = 5;
         if (timestamps.size() < GUARD) {
             logger.info("set previous last value {}", last.get(index));
             return last.get(index);
